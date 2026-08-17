@@ -33,22 +33,26 @@ class DSPRenderer(ClangRenderer):
       'void* HAP_mmap(void *addr, int len, int prot, int flags, int fd, long offset);', 'int HAP_munmap(void *addr, int len);',
       'unsigned long long HAP_perf_get_time_us(void);'] + super()._render_defines(uops)
 
+  # pra[0]=[n_arenas, arena sizes], pra[1]=8-byte slots (GLOBAL: arena idx + offset; ALU: the value), pra[2]=timer, pra[3+j]=arena j fd
   def _render_entry(self, function_name:str, bufs:list[tuple[str,tuple[UOp,bool]]]) -> str:
     msrc = ['int entry(unsigned long long handle, unsigned int sc, remote_arg* pra) {',
             'struct dcvs_v2_req req = {.type=7, .dcvs_enable=0, .set_latency=1, .latency=100, .set_dcvs_params=1, .target_corner = 6 /* TURBO */};',
             'HAP_power_set((void*)handle, (void*)&req);']
     msrc += ['if ((sc>>24) != 2) return 0;']
+    # one HAP_mmap per ARENA, not per buffer -- which is what lifts upstream's 16-buffer ceiling (sc's 8-bit fd count now binds arenas)
+    msrc += ['int na = ((int*)pra[0].buf.pv)[0];', 'void *bases[16];',
+             'for (int j = 0; j < na; j++) bases[j] = HAP_mmap(0, ((int*)pra[0].buf.pv)[1+j], 3, 0, pra[3+j].dma.fd, 0);']
     msrc += [f'{self._render_dtype(b[1][0].dtype) if b[1][0].addrspace == AddrSpace.ALU else "int"} sz_or_val_{i} = '
-             f'*({self._render_dtype(b[1][0].dtype) if b[1][0].addrspace == AddrSpace.ALU else "int"}*)((char*)pra[0].buf.pv+{i*8});'
+             f'*({self._render_dtype(b[1][0].dtype) if b[1][0].addrspace == AddrSpace.ALU else "int"}*)((char*)pra[1].buf.pv+{i*8});'
              for i,b in enumerate(bufs)]
-    msrc += [f'int off{i} = ((int*)pra[1].buf.pv)[{i}];' for i,b in enumerate(bufs) if b[1][0].addrspace == AddrSpace.GLOBAL]
-    msrc += [f'void *buf_{i} = HAP_mmap(0,sz_or_val_{i},3,0,pra[{i+3}].dma.fd,0)+off{i};'
+    msrc += [f'void *buf_{i} = (char*)bases[sz_or_val_{i}] + ((int*)pra[1].buf.pv)[{i*2+1}];'
              for i,b in enumerate(bufs) if b[1][0].addrspace == AddrSpace.GLOBAL]
     msrc += ["unsigned long long start = HAP_perf_get_time_us();"]
     fbufs = [(f'buf_{i}' if b[1][0].addrspace == AddrSpace.GLOBAL else f'sz_or_val_{i}') for i,b in enumerate(bufs)]
     msrc += [f"{function_name}({', '.join(fbufs)});"]
     msrc += ["*(unsigned long long *)(pra[2].buf.pv) = HAP_perf_get_time_us() - start;"]
-    msrc += [f'HAP_munmap(buf_{i}, sz_or_val_{i});' for i,b in enumerate(bufs) if b[1][0].addrspace == AddrSpace.GLOBAL]
+    # NOT optional: arenas are ION_FLAG_CACHED, so the munmap is what makes the DSP's writes visible to the host
+    msrc += ['for (int j = 0; j < na; j++) HAP_munmap(bases[j], ((int*)pra[0].buf.pv)[1+j]);']
     msrc += ["return 0; }"]
     return '\n'.join(msrc)
 
@@ -69,39 +73,60 @@ class DSPProgram(Program['DSPDevice']):
   def __init__(self, dev:DSPDevice, obj:TinyELF): self.dev, self.lib, self.signature = dev, obj.lib, obj.signature
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
-    if len(bufs) >= 16: raise RuntimeError(f"Too many buffers to execute: {len(bufs)}")
-
-    pra, fds, attrs, _ = rpc_prep_args(ins=[var_vals_mv:=memoryview(bytearray((len(bufs)+len(vals))*8)), off_mv:=memoryview(bytearray(len(bufs)*4))],
-                                       outs=[timer:=memoryview(bytearray(8)).cast('Q')], in_fds=[b.share_info.fd for b in bufs])
-    for i,b in enumerate(bufs): struct.pack_into('i', var_vals_mv, i*8, b.size)
+    arenas = self.dev.arenas
+    pra, fds, attrs, _ = rpc_prep_args(ins=[sz_mv:=memoryview(bytearray((len(arenas)+1)*4)),
+                                            var_vals_mv:=memoryview(bytearray((len(bufs)+len(vals))*8))],
+                                       outs=[timer:=memoryview(bytearray(8)).cast('Q')], in_fds=[a.share_info.fd for a in arenas])
+    sz_mv.cast('i')[:] = array.array('i', [len(arenas)] + [round_up(a.bump, 0x1000) for a in arenas])
+    # a buffer's slot is (arena, offset) where upstream put its size; a scalar still packs per-dtype into the same 8 bytes
+    for i,b in enumerate(bufs): struct.pack_into('ii', var_vals_mv, i*8, arenas.index(b.arena), b.offset)
     for i,(v,(_,_,dt,_)) in enumerate(zip(vals, self.signature[len(bufs):]), start=len(bufs)): struct.pack_into(unwrap(dt.fmt), var_vals_mv, i*8, v)
-    off_mv.cast('I')[:] = array.array('I', tuple(b.offset for b in bufs))
-    self.dev.exec_lib(self.lib, rpc_sc(method=2, ins=2, outs=1, fds=len(bufs)), pra, fds, attrs)
+    self.dev.exec_lib(self.lib, rpc_sc(method=2, ins=2, outs=1, fds=len(arenas)), pra, fds, attrs)
+    self.dev.last_kernel_us = timer[0]   # the on-DSP time, which the JIT otherwise swallows
     return timer[0] / 1e6
 
 class DSPBuffer:
-  def __init__(self, va_addr:int, size:int, share_info, offset:int=0):
-    self.va_addr, self.size, self.share_info, self.offset = va_addr, size, share_info, offset
+  def __init__(self, va_addr:int, size:int, share_info, offset:int=0, arena:DSPArena|None=None):
+    self.va_addr, self.size, self.share_info, self.offset, self.arena = va_addr, size, share_info, offset, arena
+
+class DSPArena:
+  """One ion allocation buffers suballocate from, so a call passes one fd per ARENA (FastRPC caps an invoke at 255) and the entry HAP_mmaps one."""
+  def __init__(self, dev:DSPDevice, size:int):
+    b = qcom_dsp.ION_IOC_ALLOC(dev.ion_fd, len=size, align=0x1000, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID, flags=qcom_dsp.ION_FLAG_CACHED)
+    self.share_info = qcom_dsp.ION_IOC_SHARE(dev.ion_fd, handle=b.handle)
+    self.va_addr = libc.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, self.share_info.fd, 0)
+    self.size, self.bump, self.free_list = size, 0, []
+
+  def alloc(self, size:int) -> int|None:
+    for i,(off,sz) in enumerate(self.free_list):   # first fit, then bump
+      if sz >= size:
+        self.free_list.pop(i)
+        if sz > size: self.free_list.append((off+size, sz-size))
+        return off
+    if self.bump+size > self.size: return None
+    self.bump += size
+    return self.bump-size
 
 class DSPAllocator(Allocator['DSPDevice']):
   def _alloc(self, size:int, options:BufferSpec):
-    if getenv("MOCKDSP"): fd, share_info, flags = -1, None, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS
-    else:
-      b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=size, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID, flags=qcom_dsp.ION_FLAG_CACHED)
-      fd, flags = (share_info:=qcom_dsp.ION_IOC_SHARE(self.dev.ion_fd, handle=b.handle)).fd, mmap.MAP_SHARED
-    return DSPBuffer(libc.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, flags, fd, 0), size, share_info, offset=0)
+    if getenv("MOCKDSP"): return DSPBuffer(libc.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS, -1, 0), size, None)
+    asz = round_up(size, 0x200)   # the SLOT rounds, never buf.size -- _as_buffer/_copyout hand out a memoryview of exactly that many bytes
+    for a in self.dev.arenas:
+      if (off:=a.alloc(asz)) is not None: break
+    else:   # nothing had room. The DSP remaps the whole ALLOCATION every call (~0.05ms/MB + ~0.2ms/arena), so grow geometrically: allocated ~2x live
+      self.dev.arenas.append(a:=DSPArena(self.dev, max(round_up(asz, 0x1000), sum(x.size for x in self.dev.arenas))))
+      off, a.bump = 0, asz
+    return DSPBuffer(a.va_addr+off, size, a.share_info, off, a)
 
   @suppress_finalizing
   def _free(self, opaque:DSPBuffer, options:BufferSpec):
-    libc.munmap(opaque.va_addr, opaque.size)
-    if opaque.share_info is not None:
-      os.close(opaque.share_info.fd)
-      qcom_dsp.ION_IOC_FREE(self.dev.ion_fd, handle=opaque.share_info.handle)
+    if opaque.arena is None: libc.munmap(opaque.va_addr, opaque.size)   # MOCKDSP
+    else: opaque.arena.free_list.append((opaque.offset, round_up(opaque.size, 0x200)))
 
   def _as_buffer(self, src:DSPBuffer) -> memoryview: return to_mv(src.va_addr, src.size)
   def _copyin(self, dest:DSPBuffer, src:memoryview): ctypes.memmove(dest.va_addr, mv_address(src), src.nbytes)
   def _copyout(self, dest:memoryview, src:DSPBuffer): ctypes.memmove(mv_address(dest), src.va_addr, dest.nbytes)
-  def _offset(self, buf, size:int, offset:int): return DSPBuffer(buf.va_addr+offset, size, buf.share_info, buf.offset+offset)
+  def _offset(self, buf, size:int, offset:int): return DSPBuffer(buf.va_addr+offset, size, buf.share_info, buf.offset+offset, buf.arena)
 
 class DSPCompiler(Compiler):
   def __init__(self, mock:bool=False):
@@ -135,9 +160,13 @@ class DSPDevice(Compiled):
     if getenv("MOCKDSP"): super().__init__(device, DSPAllocator(self), [MockDSPRenderer], MockDSPProgram)
     else:
       self.ion_fd = os.open('/dev/ion', os.O_RDONLY)
+      self.arenas:list[DSPArena] = []
+      self.lib_handle:tuple = (None, None)   # (lib bytes, dlopen handle) of the resident lib, see exec_lib
+      self.last_kernel_us = 0
       super().__init__(device, DSPAllocator(self), [DSPRenderer], DSPProgram)
       fastrpc_shell = memoryview(bytearray(pathlib.Path('/dsp/cdsp/fastrpc_shell_3').read_bytes()))
-      self.shell_buf = self.allocator.alloc(round_up(fastrpc_shell.nbytes, 0x1000), BufferSpec(nolru=True))
+      # its own ion alloc: FASTRPC_IOCTL_INIT passes the fd and the DSP expects the shell at offset 0, so it cannot share an arena
+      self.shell_buf = DSPArena(self, round_up(fastrpc_shell.nbytes, 0x1000))
       ctypes.memmove(self.shell_buf.va_addr, mv_address(fastrpc_shell), fastrpc_shell.nbytes)
 
       self.init_dsp()
@@ -158,19 +187,29 @@ class DSPDevice(Compiled):
 
   def exec_lib(self, lib, sc, args, fds, attrs):
     def _exec_lib():
-      handle = self.open_lib(lib)
-      qcom_dsp.FASTRPC_IOCTL_INVOKE_ATTRS(self.rpc_fd, fds=fds, attrs=attrs, inv=qcom_dsp.struct_fastrpc_ioctl_invoke(handle=handle, sc=sc, pra=args))
-      self.close_lib(handle)
+      # open_lib makes the DSP dlopen file:///tinylib, which RPCListener serves by streaming the whole .so back, so opening per call re-uploads the
+      # kernel every run (-4.6ms/frame). Only the newest handle is kept: the cDSP keys modules by FILENAME and they are all "tinylib".
+      if self.lib_handle[0] != lib:
+        if self.lib_handle[1] is not None:
+          with contextlib.suppress(OSError, RuntimeError): self.close_lib(self.lib_handle[1])
+        self.lib_handle = (lib, self.open_lib(lib))
+      qcom_dsp.FASTRPC_IOCTL_INVOKE_ATTRS(self.rpc_fd, fds=fds, attrs=attrs,
+                                          inv=qcom_dsp.struct_fastrpc_ioctl_invoke(handle=self.lib_handle[1], sc=sc, pra=args))
     try: _exec_lib()
-    except (OSError, PermissionError):
+    except (OSError, PermissionError) as first:
       # DSP might ask for a connection reset or just fail with operation not permitted, try to reset connection.
-      self.init_dsp()
+      # ALWAYS CHAIN `first`: a kernel that faults the PD raises EPERM here, and the recovery below throws its own error tearing the PD down, so
+      # without it the caller sees only "ioctl returned 39" pointing at init_dsp -- no visible relation to the kernel that actually faulted.
+      self.lib_handle = (None, None)   # init_dsp tears down the PD, so the cached handle is stale
+      try: self.init_dsp()
+      except Exception: raise RuntimeError(f"DSP reset failed after {first!r}") from first
       try: _exec_lib()
-      except (OSError, PermissionError) as e: raise RuntimeError(e)
+      except (OSError, PermissionError) as e: raise RuntimeError(e) from first
 
   def init_dsp(self):
     if hasattr(self, 'rpc_fd'):
-      with contextlib.suppress(OSError):
+      # RuntimeError too: _do_ioctl raises that, not OSError, so a teardown on an already-faulted PD escaped this suppress and masked the real error
+      with contextlib.suppress(OSError, RuntimeError):
         qcom_dsp.FASTRPC_IOCTL_INVOKE(self.rpc_fd, handle=4, sc=rpc_sc(method=2, ins=0, outs=0)) # pylint: disable=access-member-before-definition
       os.close(self.rpc_fd) # pylint: disable=access-member-before-definition
 
@@ -179,6 +218,9 @@ class DSPDevice(Compiled):
     qcom_dsp.FASTRPC_IOCTL_CONTROL(self.rpc_fd, req=0x3)
     qcom_dsp.FASTRPC_IOCTL_INIT(self.rpc_fd, flags=0x1, file=self.shell_buf.va_addr, filelen=self.shell_buf.size, filefd=self.shell_buf.share_info.fd)
     qcom_dsp.FASTRPC_IOCTL_INVOKE(self.rpc_fd, handle=3, sc=rpc_sc(method=3, ins=0, outs=0))
+
+# the cDSP asks for files by BARE NAME (e.g. the unsigned-code testsig "testsig-0x<serial>.so"), which resolves nowhere from our cwd
+def _dsp_path(n:str) -> str: return p if not os.path.exists(n) and os.path.exists(p:=os.path.join("/dsp/cdsp", n)) else n
 
 class RPCListener(threading.Thread):
   def __init__(self, device:DSPDevice):
@@ -196,8 +238,10 @@ class RPCListener(threading.Thread):
       # Update message request and send it.
       msg_send[:] = array.array('I', [context, status, req_args[1].buf.len, in_buf.nbytes])
 
+      # MUST NOT DIE: it streams the .so back on dlopen, so if it exits the next load hangs forever (unkillable D state). A nonzero rc is EXPECTED --
+      # it shares rpc_fd with the main thread, which exec_lib retries -- and _do_ioctl raises RuntimeError, so OSError alone let it die.
       try: qcom_dsp.FASTRPC_IOCTL_INVOKE(self.device.rpc_fd, handle=0x3, sc=0x04020200, pra=req_args)
-      except OSError: continue # retry
+      except (OSError, RuntimeError): continue # a collision with the main thread's invoke, not a real error
 
       context, inbufs, outbufs = msg_recv[0], ((sc:=msg_recv[2]) >> 16) & 0xff, (msg_recv[2] >> 8) & 0xff
 
@@ -217,7 +261,7 @@ class RPCListener(threading.Thread):
       status = 0 # reset status, will set if error
       if sc == 0x20200: pass # greating
       elif sc == 0x13050100: # open
-        try: out_args[0].cast('I')[0] = TINYFD if (name:=in_args[3].tobytes()[:-1].decode()) == "tinylib" else os.open(name, os.O_RDONLY)
+        try: out_args[0].cast('I')[0] = TINYFD if (name:=in_args[3].tobytes()[:-1].decode()) == "tinylib" else os.open(_dsp_path(name), os.O_RDONLY)
         except OSError: status = 1
       elif sc == 0x3010000:
         if (fd:=in_args[0].cast('I')[0]) != TINYFD: os.close(fd)
@@ -235,7 +279,7 @@ class RPCListener(threading.Thread):
         out_args[1][:len(buf)] = buf
         out_args[0].cast('I')[0:2] = array.array('I', [len(buf), int(len(buf) == 0)])
       elif sc == 0x1f020100: # stat
-        stat = os.stat(in_args[1].tobytes()[:-1].decode())
+        stat = os.stat(_dsp_path(in_args[1].tobytes()[:-1].decode()))
         out_stat = qcom_dsp.struct_apps_std_STAT.from_address(mv_address(out_args[0]))
         for f in out_stat._real_fields_: out_stat.__setattr__(f[0], int(getattr(stat, f"st_{f[0]}", 0)))
       elif sc == 0x2010100: # mmap
